@@ -23,6 +23,7 @@
  *    60  name substring (>=4 chars, >=50% coverage)
  *    60  exact weak-keyword match
  *    50  description / prose mentions the term
+ *    45  usage guidance mentions the term
  *    40  name Levenshtein distance 2
  *    40  weak-keyword substring
  *    30  keyword Levenshtein distance 2
@@ -30,6 +31,14 @@
  *
  * Name + keyword signals always outweigh description/prose, so an exact match
  * sorts above an incidental mention.
+ *
+ * Description and guidance are separate tiers on purpose. A component's own
+ * one-line description saying "notification" is a claim about what it IS; the
+ * same word inside another component's best-practice advice is a passing
+ * mention. Scored equally, `Toast` — "a brief, non-blocking notification" —
+ * ties with `Card`, `Dialog` and `Item`, which merely mention notifications in
+ * their guidance, and ties break alphabetically, so Toast falls off the end of
+ * its own best query.
  *
  * `keywords` carry AUTHORED intent — a block's `componentsUsed`, a page's
  * `category` words. `weakKeywords` are DERIVED: the components a page template
@@ -41,21 +50,39 @@
  * queries they have nothing to do with.
  */
 
-import {pathToFileURL} from 'node:url';
+import {readDocView} from '../../foundation/doc-compiler/read.mjs';
 import {findCoreDir} from '../../foundation/fs/paths.mjs';
 import {
   discoverComponents,
-  discoverIntegrationComponents,
+  discoverValidIntegrationComponents,
   findComponentReadme,
   resolveImportPath,
+  resolveIntegrationImportPath,
 } from '../../foundation/discovery/component-discovery.mjs';
-import {discoverHooks, findHookDoc} from '../../foundation/discovery/hook-discovery.mjs';
+import {
+  discoverHooks,
+  findHookDoc,
+} from '../../foundation/discovery/hook-discovery.mjs';
 import {loadIntegrationsSafely} from '../component/_adapter.mjs';
 import {levenshteinDistance} from '../../foundation/text/string-utils.mjs';
 import {discoverTemplates, extractComponents} from '../template/template.mjs';
-import {loadDocsCatalog, loadTopicDoc} from '../docs/_adapter.mjs';
+import {templateLookupIds} from '../../foundation/discovery/template-adapter.mjs';
+import {
+  guideEntry,
+  loadDocsCatalog,
+  lowerTopic,
+  projectTree,
+  holdsOwnName,
+} from '../docs/_adapter.mjs';
+import {unlinkText} from '../../foundation/doc-compiler/links.mjs';
+import {nodeView} from '../docs/node/node.mjs';
+import {
+  sectionKey,
+  sectionSummary,
+} from '../../foundation/discovery/docs-section-key.mjs';
 import {AstryxError} from '../error.mjs';
 import {ERROR_CODES} from '../../foundation/response/error-codes.mjs';
+import {setResultCoverage} from './coverage.mjs';
 
 /**
  * A search candidate gathered from one content domain. Extra underscore-
@@ -67,10 +94,21 @@ import {ERROR_CODES} from '../../foundation/response/error-codes.mjs';
  * @property {string[]} [weakKeywords]
  * @property {string} [description]
  * @property {string[]} [prose]
+ * @property {string[]} [guidance]
  * @property {string} [_import]
  * @property {string} [_title]
+ * @property {string} [_topic] - A doc result's topic or docs-tree route.
+ * @property {string} [_section] - A doc result's section key, when it is one section.
+ * @property {string} [_command] - The command that reads exactly this doc part.
+ * @property {string} [_parent] - The command that opens the level above a doc
+ *   part: its topic's section list, or the docs-tree namespace it sits in.
+ * @property {string} [_package] - The npm package that authored a docs-tree
+ *   doc part. Flat topics carry none: an extension's sections can come from
+ *   another package.
  * @property {string} [_displayName]
  * @property {'page'|'block'} [_kind]
+ * @property {string} [_resultName]
+ * @property {string} [_commandName]
  */
 
 /**
@@ -80,7 +118,17 @@ import {ERROR_CODES} from '../../foundation/response/error-codes.mjs';
  * and its siblings). Lowercase, single words or short phrases.
  */
 const SYNONYMS = {
-  dashboard: ['overview', 'analytics', 'kpi', 'kpis', 'metrics', 'stats', 'reporting', 'insights', 'control'],
+  dashboard: [
+    'overview',
+    'analytics',
+    'kpi',
+    'kpis',
+    'metrics',
+    'stats',
+    'reporting',
+    'insights',
+    'control',
+  ],
   login: ['signin', 'auth', 'authentication', 'sso', 'credentials', 'account'],
   signup: ['register', 'registration', 'onboarding'],
   payment: ['checkout', 'billing', 'card', 'pay', 'purchase', 'order'],
@@ -141,7 +189,6 @@ export function stem(w) {
   return s;
 }
 
-
 /** Valid domain filters for `--type`. */
 export const SEARCH_DOMAINS = ['component', 'hook', 'doc', 'template'];
 
@@ -150,12 +197,66 @@ export const SEARCH_DOMAINS = ['component', 'hook', 'doc', 'template'];
  * ("a page where you can see business stats") ranks on its content words.
  */
 const STOPWORDS = new Set([
-  'a', 'an', 'the', 'of', 'for', 'to', 'with', 'and', 'or', 'in', 'on', 'at',
-  'by', 'that', 'this', 'my', 'your', 'our', 'their', 'is', 'are', 'be', 'it',
-  'its', 'as', 'from', 'page', 'screen', 'app', 'application', 'view', 'where',
-  'you', 'can', 'some', 'like', 'just', 'basically', 'kinda', 'want', 'wants',
-  'need', 'needs', 'something', 'thing', 'things', 'build', 'make', 'create',
-  'i', 'me', 'we', 'us', 'so', 'up', 'out', 'over', 'side', 'one', 'big',
+  'a',
+  'an',
+  'the',
+  'of',
+  'for',
+  'to',
+  'with',
+  'and',
+  'or',
+  'in',
+  'on',
+  'at',
+  'by',
+  'that',
+  'this',
+  'my',
+  'your',
+  'our',
+  'their',
+  'is',
+  'are',
+  'be',
+  'it',
+  'its',
+  'as',
+  'from',
+  'page',
+  'screen',
+  'app',
+  'application',
+  'view',
+  'where',
+  'you',
+  'can',
+  'some',
+  'like',
+  'just',
+  'basically',
+  'kinda',
+  'want',
+  'wants',
+  'need',
+  'needs',
+  'something',
+  'thing',
+  'things',
+  'build',
+  'make',
+  'create',
+  'i',
+  'me',
+  'we',
+  'us',
+  'so',
+  'up',
+  'out',
+  'over',
+  'side',
+  'one',
+  'big',
 ]);
 
 /**
@@ -166,12 +267,14 @@ const STOPWORDS = new Set([
  * @returns {string[]}
  */
 export function tokenizeQuery(term) {
-  return term
-    .split(/\s+/)
-    // Strip only leading/trailing punctuation; keep joined identifiers intact
-    // (e.g. "foo_bar" stays one token) so gibberish stays gibberish.
-    .map(t => t.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ''))
-    .filter(t => t.length >= 2 && !STOPWORDS.has(t));
+  return (
+    term
+      .split(/\s+/)
+      // Strip only leading/trailing punctuation; keep joined identifiers intact
+      // (e.g. "foo_bar" stays one token) so gibberish stays gibberish.
+      .map(t => t.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ''))
+      .filter(t => t.length >= 2 && !STOPWORDS.has(t))
+  );
 }
 
 /**
@@ -189,6 +292,14 @@ export function tokenizeQuery(term) {
  * Minimum per-token score (in the multi-word pass) to count as a real match.
  * 50 = a genuine name/keyword/description hit; below that is loose Levenshtein
  * fuzz that would otherwise turn gibberish queries into noise.
+ *
+ * Guidance (45) is deliberately BELOW this floor, so it never counts as one of
+ * the matched concepts in a multi-word query. Measured: letting it count moved
+ * `nested menu` from SideNav to List and `explain why a field is required` from
+ * Field to TextInput — in both cases a component whose guidance happens to
+ * mention the other word displaced the one that IS the answer. Breadth is not
+ * relevance, the same reason `weakKeywords` are capped. Guidance still decides
+ * single-word queries and still breaks ties, which is where it earns its place.
  */
 const MIN_TOKEN_SCORE = 50;
 
@@ -207,7 +318,8 @@ function bestForToken(tok, candidate) {
       const h = scoreCandidate(s, candidate);
       if (h) {
         const score = Math.round(h.score * 0.85);
-        if (!best || score > best.score) best = {score, reason: `${h.reason} (~${tok})`};
+        if (!best || score > best.score)
+          best = {score, reason: `${h.reason} (~${tok})`};
       }
     }
   }
@@ -218,18 +330,46 @@ function bestForToken(tok, candidate) {
  * @param {string} term - Lowercased full query.
  * @param {string[]} tokens - Content tokens from tokenizeQuery(term).
  * @param {Candidate} candidate
- * @returns {{score: number, reason: string} | null}
+ * @returns {{score: number, reason: string, matched: number, total: number} | null}
+ *   `matched`/`total` are the query concepts this candidate answered, out of
+ *   the concepts the query had. Callers that must distinguish "matched one word
+ *   of three" from "matched all three" — `build`, which gates its pages group
+ *   on coverage — cannot recover that from the score, because a single strong
+ *   hit and a broad weak one land on the same number.
  */
 export function scoreQuery(term, tokens, candidate) {
+  const total = Math.max(tokens.length, 1);
+  // A whole-phrase hit answered the whole query by definition.
+  const asFull = (/** @type {{score: number, reason: string}} */ hit) => ({
+    ...hit,
+    matched: total,
+    total,
+  });
   const full = scoreCandidate(term, candidate);
 
   // 0–1 content tokens: keep whole-phrase fuzzy matching (typo tolerance for
   // single words), but if stopwords left exactly one DIFFERENT token (e.g.
   // "pricing page" → "pricing"), score that token too and take the stronger.
   if (tokens.length <= 1) {
-    const single = tokens.length === 1 ? bestForToken(tokens[0], candidate) : null;
-    if (full && (!single || full.score >= single.score)) return full;
-    return single;
+    const single =
+      tokens.length === 1 ? bestForToken(tokens[0], candidate) : null;
+    if (full && (!single || full.score >= single.score)) return asFull(full);
+    return single ? asFull(single) : null;
+  }
+
+  // The full (untokenized) query matching a candidate's name or a declared
+  // keyword VERBATIM — full.score 90 or 100, the only two scoreCandidate
+  // outcomes at or above that mark — is a deliberate, explicit label the
+  // author chose for exactly this multi-word concept. Promote it to a
+  // reserved top tier, safely above the token-sum path's ceiling below
+  // (~151: 100 avg + 36 bonus + 15 coverage), so it always outranks a
+  // candidate that merely happens to contain several of the query's
+  // individual words. Without this, "table of contents" never surfaces
+  // Outline (which declares that exact phrase as a keyword) because dozens
+  // of Table-related templates each match "table" and "contents" separately
+  // and accumulate a higher raw score (#5239).
+  if (full && full.score >= 90) {
+    return asFull({score: full.score + 100, reason: full.reason});
   }
 
   // Multi-word natural language: score each content token, counting only
@@ -246,7 +386,7 @@ export function scoreQuery(term, tokens, candidate) {
       hitTerms.push(tok);
     }
   }
-  if (matched === 0) return full;
+  if (matched === 0) return full ? asFull(full) : null;
 
   // Base the score on the STRONGEST concept that matched, plus a bonus per
   // additional matched concept and a coverage term.
@@ -266,12 +406,16 @@ export function scoreQuery(term, tokens, candidate) {
   // terms can never score lower, since every term of the expression is
   // non-decreasing in the set of matched tokens.
   const coverage = matched / tokens.length;
-  const tokenScore = Math.round(strongest + Math.min(matched - 1, 3) * 12 + coverage * 15);
+  const tokenScore = Math.round(
+    strongest + Math.min(matched - 1, 3) * 12 + coverage * 15,
+  );
 
-  if (full && full.score >= tokenScore) return full;
+  if (full && full.score >= tokenScore) return asFull(full);
   return {
     score: tokenScore,
     reason: `matches ${matched}/${tokens.length} terms: ${hitTerms.join(', ')}`,
+    matched,
+    total,
   };
 }
 
@@ -287,11 +431,19 @@ export function scoreQuery(term, tokens, candidate) {
  * @param {string[]} [candidate.weakKeywords] - Derived signal (components a page renders).
  * @param {string} [candidate.description]
  * @param {string[]} [candidate.prose] - Extra free-text blobs (doc section text, best practices).
+ * @param {string[]} [candidate.guidance] - Usage guidance (features, best practices) — scored a tier below description.
  * @returns {{score: number, reason: string} | null}
  */
 export function scoreCandidate(
   term,
-  {name, keywords = [], weakKeywords = [], description = '', prose = []},
+  {
+    name,
+    keywords = [],
+    weakKeywords = [],
+    description = '',
+    prose = [],
+    guidance = [],
+  },
 ) {
   let best = 0;
   let reason = '';
@@ -315,7 +467,11 @@ export function scoreCandidate(
     // Substring (both directions), min 4 chars, >=50% coverage.
     const shorter = term.length < nameLower.length ? term : nameLower;
     const longer = term.length < nameLower.length ? nameLower : term;
-    if (shorter.length >= 4 && longer.includes(shorter) && shorter.length / longer.length >= 0.5) {
+    if (
+      shorter.length >= 4 &&
+      longer.includes(shorter) &&
+      shorter.length / longer.length >= 0.5
+    ) {
       consider(60, `name contains "${shorter}"`);
     }
     const dist = levenshteinDistance(term, nameLower);
@@ -359,7 +515,7 @@ export function scoreCandidate(
     }
   }
 
-  // ── Prose / description signals (stem-tolerant whole word) ──────
+  // ── Prose / description / guidance signals (stem-tolerant whole word) ──
   // Match the term's stem as a whole word, tolerating plural/gerund suffixes
   // so "chart" matches "charts" and "filter" matches "filtering".
   if (term.length >= 3) {
@@ -369,10 +525,23 @@ export function scoreCandidate(
     if (description && re.test(description.toLowerCase())) {
       consider(50, `description mentions "${term}"`);
     } else {
+      let matchedProse = false;
       for (const blob of prose) {
         if (blob && re.test(String(blob).toLowerCase())) {
           consider(50, `docs mention "${term}"`);
+          matchedProse = true;
           break;
+        }
+      }
+      // A tier below prose: guidance is what a component says about USING it,
+      // so the term appearing there is weaker evidence than the component's own
+      // summary. Only consulted when nothing stronger matched.
+      if (!matchedProse) {
+        for (const blob of guidance) {
+          if (blob && re.test(String(blob).toLowerCase())) {
+            consider(45, `guidance mentions "${term}"`);
+            break;
+          }
         }
       }
     }
@@ -382,18 +551,70 @@ export function scoreCandidate(
 }
 
 /**
- * Load a doc module's `docs`/`doc` export, swallowing errors.
+ * A component or hook doc, compiled, or null when it cannot be read.
  * @param {string} docPath
  * @param {string} [exportName]
+ * @param {'components' | 'hooks'} [root]
  * @returns {Promise<any>}
  */
-async function loadModuleDoc(docPath, exportName = 'docs') {
+async function loadModuleDoc(
+  docPath,
+  exportName = 'docs',
+  root = 'components',
+) {
   try {
-    const mod = await import(pathToFileURL(docPath).href);
-    return mod[exportName] ?? null;
+    // Support both the stamped default export and the legacy named export.
+    return (
+      (await readDocView(docPath, {
+        root,
+        loader: 'native',
+        exports: ['default', exportName],
+      })) ?? null
+    );
   } catch {
     return null;
   }
+}
+
+/**
+ * Build component candidates from core's own tree: name + keywords +
+ * usage/description from the component's .doc.mjs.
+ * @param {string} coreDir
+ * @returns {Promise<Candidate[]>}
+ */
+/**
+ * Usage guidance from a component doc: its feature list and its best-practice
+ * advice, flattened to plain strings.
+ *
+ * This is where a reader's vocabulary usually lives. `Banner` calls itself "a
+ * persistent message" and only its guidance names "form errors, system
+ * updates, maintenance notices" — so a search for the words people actually
+ * type finds nothing without it.
+ *
+ * @param {any} doc
+ * @returns {string[]}
+ */
+function guidanceFrom(doc) {
+  if (!doc) return [];
+  const features = Array.isArray(doc.features) ? doc.features : [];
+  const practices = Array.isArray(doc.usage?.bestPractices)
+    ? doc.usage.bestPractices
+    : [];
+  return [...features, ...practices]
+    .map(entry =>
+      typeof entry === 'string'
+        ? entry
+        : [
+            entry?.title,
+            entry?.text,
+            entry?.description,
+            entry?.do,
+            entry?.dont,
+          ]
+            .filter(Boolean)
+            .join(' '),
+    )
+    .filter(Boolean);
 }
 
 /**
@@ -412,11 +633,14 @@ async function gatherCoreComponents(coreDir) {
     /** @type {string[]} */
     let keywords = [];
     let description = '';
+    /** @type {string[]} */
+    let guidance = [];
     if (readme && readme.endsWith('.doc.mjs')) {
       const doc = await loadModuleDoc(readme);
       if (doc) {
         keywords = Array.isArray(doc.keywords) ? doc.keywords : [];
         description = doc.usage?.description || doc.description || '';
+        guidance = guidanceFrom(doc);
       }
     }
     candidates.push({
@@ -424,6 +648,7 @@ async function gatherCoreComponents(coreDir) {
       name: comp,
       keywords,
       description,
+      guidance,
       _import: resolveImportPath(coreDir, comp),
     });
   }
@@ -445,14 +670,32 @@ async function gatherIntegrationComponents(cwd) {
   /** @type {Candidate[]} */
   const candidates = [];
   for (const integration of loadedIntegrations) {
-    for (const rec of discoverIntegrationComponents(integration)) {
+    const {components} = await discoverValidIntegrationComponents(integration);
+    for (const rec of components) {
       const doc = await loadModuleDoc(rec.docPath);
       candidates.push({
         domain: 'component',
         name: rec.name,
         keywords: doc && Array.isArray(doc.keywords) ? doc.keywords : [],
         description: doc ? doc.usage?.description || doc.description || '' : '',
-        _import: rec.package,
+        guidance: guidanceFrom(doc),
+        // Exactly what `component` reports: a doc may state its own specifier
+        // (one entry point exporting several components), and only when it
+        // does not do we resolve the subpath against the owning package's
+        // exports — read off the integration, which the loader already parsed.
+        // Reporting the bare package name here handed out a path that does not
+        // resolve, and disagreed with what `component <Name>` said about the
+        // very same component.
+        _import: resolveIntegrationImportPath(
+          {
+            exportsMap: integration.__packageExports,
+            packageDir: integration.__packageDir,
+            docPath: rec.docPath,
+            packageName: rec.package,
+          },
+          rec.name,
+          doc?.import,
+        ),
       });
     }
   }
@@ -492,7 +735,7 @@ async function gatherHooks(coreDir) {
     let description = '';
     let importPath = '@astryxdesign/core/hooks';
     if (docPath) {
-      const doc = await loadModuleDoc(docPath);
+      const doc = await loadModuleDoc(docPath, 'docs', 'hooks');
       if (doc) {
         keywords = Array.isArray(doc.keywords) ? doc.keywords : [];
         description = doc.usage?.description || doc.description || '';
@@ -511,7 +754,11 @@ async function gatherHooks(coreDir) {
 }
 
 /**
- * Build doc-topic candidates: topic name + description + section prose.
+ * Build doc candidates at the grain a reader reads them: each section of a
+ * topic, whose command reads just that section; each topic as a whole, whose
+ * command lists its sections; and each docs-tree node by its route. The tree's
+ * guides split into sections like topics, and its typed docs also match by
+ * their own name, so `assertResponse` finds `cli/api/functions/assert-response`.
  *
  * Reads the project's catalog rather than the CLI's own docs directory, so a
  * topic an integration contributed (or replaced) is searchable exactly like a
@@ -523,42 +770,272 @@ async function gatherHooks(coreDir) {
 async function gatherDocs(cwd) {
   /** @type {Candidate[]} */
   const candidates = [];
-  let entries;
+  let catalog;
   try {
-    entries = (await loadDocsCatalog(cwd)).entries();
+    catalog = await loadDocsCatalog(cwd);
   } catch {
     return candidates;
   }
-  for (const entry of entries) {
-    let doc = null;
+  let tree = null;
+  try {
+    tree = await projectTree(catalog);
+  } catch {
+    // `astryx doctor` reports a tree that fails to build; search still
+    // indexes the topics.
+  }
+  for (const entry of catalog.entries()) {
+    // A topic whose name opens another doc (spec:AST-046 FR11) is not
+    // offered: every hit's command must open the hit.
+    if (tree && !holdsOwnName(tree, catalog, entry)) continue;
+    let lowered = null;
     try {
-      doc = await loadTopicDoc(entry);
+      lowered = await lowerTopic(catalog, entry);
     } catch {
       // A topic that cannot be loaded is reported by the commands that own
       // integration issues; search just cannot index it.
     }
-    let description = '';
-    /** @type {string[]} */
-    const prose = [];
-    if (doc) {
-      description = doc.description || '';
-      for (const section of doc.sections || []) {
-        if (section.title) prose.push(section.title);
-        for (const block of section.content || []) {
-          if (block.type === 'prose' && block.text) prose.push(block.text);
-        }
+    const doc = lowered?.doc ?? null;
+    // A flat topic lives in the Unorganized level; its hits say so, and name
+    // the package each section came from.
+    const home = tree?.get(entry.name);
+    const placed = home?.ref?.flatTopic === entry.name ? home : null;
+    /** @type {Map<string, string>} */
+    const packages = new Map([
+      [entry.providerId ?? entry.package, entry.package],
+      ...entry.extensions.map(
+        ext => /** @type {[string, string]} */ ([ext.providerId ?? ext.package, ext.package]),
+      ),
+    ]);
+    candidates.push(
+      ...topicCandidates(
+        entry.name,
+        doc,
+        entry.title,
+        '',
+        placed && tree
+          ? [
+              ...tree.ancestors(placed).map(a => a.title),
+              doc?.title || entry.title || entry.name,
+            ].join(' › ')
+          : undefined,
+        placed ? `astryx docs ${placed.parent}` : undefined,
+        entry.package,
+        key =>
+          packages.get(lowered?.sectionProviders?.[key] ?? '') ?? entry.package,
+      ),
+    );
+  }
+  if (tree == null) return candidates;
+  for (const node of tree.nodes.values()) {
+    // A flat topic is indexed above, as a topic.
+    if (node.ref?.flatTopic) continue;
+    // A tree hit names where it lives: its ancestors' titles, then its own.
+    const path = [...tree.ancestors(node).map(a => a.title), node.title];
+    if (node.kind === 'generic') {
+      let doc = null;
+      try {
+        doc = (await lowerTopic(catalog, guideEntry(node))).doc;
+      } catch {
+        // As above: the owning commands report it.
       }
+      candidates.push(
+        ...topicCandidates(
+          node.route,
+          doc,
+          node.title,
+          node.summary,
+          path.join(' › '),
+          node.parent == null ? undefined : `astryx docs ${node.parent}`,
+          node.provider,
+        ),
+      );
+      continue;
+    }
+    const selfDoc = /** @type {any} */ (node.ref)?.selfDoc;
+    // A typed doc's content is what `astryx docs <route>` prints. The first
+    // column of its tables names what the doc defines (an error code, an
+    // option, a parameter), so each is a keyword the doc answers to.
+    /** @type {any[]} */
+    const content = (await nodeView(catalog, tree, node)).content ?? [];
+    /** @type {string[]} */
+    const defined = [];
+    for (const block of content) {
+      if (block.type !== 'table' || !Array.isArray(block.rows)) continue;
+      for (const row of block.rows)
+        if (row[0] != null) defined.push(plain(row[0]));
     }
     candidates.push({
       domain: 'doc',
-      name: entry.name,
-      keywords: [],
-      description,
-      prose,
-      _title: doc?.title || entry.title || entry.name,
+      name: node.name,
+      keywords: [
+        node.route.slice(node.route.lastIndexOf('/') + 1),
+        ...(Array.isArray(selfDoc?.keywords) ? selfDoc.keywords : []),
+        ...defined,
+        ...codeTerms({content}),
+      ],
+      description: node.summary || '',
+      prose: sectionProse({title: node.title, content}),
+      _topic: node.route,
+      _title: path.join(' › '),
+      _command: `astryx docs ${node.route}`,
+      _parent: node.parent == null ? 'astryx docs' : `astryx docs ${node.parent}`,
+      _package: node.provider,
     });
   }
   return candidates;
+}
+
+/**
+ * The words one section says: its prose, headings, and list items.
+ * @param {any} section
+ * @returns {string[]}
+ */
+function sectionProse(section) {
+  /** @type {string[]} */
+  const prose = [];
+  if (section?.title) prose.push(section.title);
+  for (const block of section?.content || []) {
+    if ((block.type === 'prose' || block.type === 'heading') && block.text) {
+      prose.push(block.text);
+    } else if (block.type === 'list' && Array.isArray(block.items)) {
+      for (const item of block.items) {
+        const text = typeof item === 'string' ? item : item?.text;
+        if (typeof text === 'string') prose.push(text);
+      }
+    } else if (block.type === 'table' && Array.isArray(block.rows)) {
+      for (const row of block.rows) prose.push(row.map(plain).join(' '));
+    } else if (block.type === 'code' && typeof block.code === 'string') {
+      prose.push([block.label, block.code].filter(Boolean).join(' '));
+    }
+  }
+  return prose;
+}
+
+/**
+ * The identifiers a doc part names in code ticks (`token-ref`,
+ * `ERR_UNKNOWN_SECTION`). Each is a keyword: a reader who types one exactly
+ * wants the part that defines or explains it.
+ * @param {any} part - a section, or `{content}` of a typed doc
+ * @returns {string[]}
+ */
+function codeTerms(part) {
+  /** @type {Set<string>} */
+  const terms = new Set();
+  /** @param {unknown} text */
+  const scan = text => {
+    for (const m of String(text ?? '').matchAll(/`([^`\s]{2,40})`/g)) {
+      terms.add(m[1]);
+    }
+  };
+  for (const block of part?.content || []) {
+    if (block.type === 'prose') scan(block.text);
+    else if (block.type === 'list' && Array.isArray(block.items)) {
+      for (const item of block.items) {
+        scan(typeof item === 'string' ? item : item?.text);
+      }
+    } else if (block.type === 'table' && Array.isArray(block.rows)) {
+      for (const row of block.rows) for (const cell of row) scan(cell);
+    }
+  }
+  return [...terms];
+}
+
+/**
+ * The headings inside a section. Each names a subsection, so a query that
+ * names one should find the section as surely as one that names its title.
+ * @param {any} section
+ * @returns {string[]}
+ */
+function headings(section) {
+  return (section?.content || [])
+    .filter(
+      (/** @type {any} */ block) => block.type === 'heading' && block.text,
+    )
+    .map((/** @type {any} */ block) => String(block.text));
+}
+
+/**
+ * A table cell as plain words, without its code ticks.
+ * @param {unknown} cell
+ * @returns {string}
+ */
+function plain(cell) {
+  return unlinkText(String(cell ?? '')).replaceAll('`', '');
+}
+
+/**
+ * The candidates one topic yields: the topic itself, and one per section when
+ * it has more than one. A topic's command lists its sections, and a section's
+ * command reads only that section, so a hit never costs a whole-topic read.
+ * @param {string} name - the topic name, or a placed guide's route
+ * @param {any} doc - the lowered topic, or null when it did not load
+ * @param {string} [title]
+ * @param {string} [summary]
+ * @param {string} [path] - where the topic lives in the docs tree, as titles
+ *   joined by ` › `; a flat topic is its own title
+ * @param {string} [parent] - the command that opens the level above the
+ *   topic: its namespace, or the Unorganized level for a flat topic
+ * @param {string} [pkg] - the npm package that authored the topic
+ * @param {(key: string) => string} [sectionPackage] - the npm package a
+ *   section came from: an extension's section names the extension's package
+ * @returns {Candidate[]}
+ */
+function topicCandidates(
+  name,
+  doc,
+  title,
+  summary = '',
+  path,
+  parent,
+  pkg,
+  sectionPackage,
+) {
+  /** @type {any[]} */
+  const sections = doc?.sections ?? [];
+  const docTitle = path || doc?.title || title || name;
+  const split = sections.length > 1;
+  /** @type {Candidate[]} */
+  const out = [
+    {
+      domain: 'doc',
+      name,
+      keywords: [
+        ...(doc?.title || title ? [doc?.title || title] : []),
+        ...(Array.isArray(doc?.keywords) ? doc.keywords : []),
+      ],
+      description: doc?.description || summary,
+      prose: split
+        ? sections.map(section => section.title).filter(Boolean)
+        : sections.flatMap(sectionProse),
+      _topic: name,
+      _title: docTitle,
+      _command: split ? `astryx docs ${name} --index` : `astryx docs ${name}`,
+      ...(parent ? {_parent: parent} : {}),
+      ...(pkg ? {_package: pkg} : {}),
+    },
+  ];
+  if (!split) return out;
+  for (const section of sections) {
+    const key = sectionKey(section);
+    out.push({
+      domain: 'doc',
+      name: key,
+      keywords: [
+        ...(section.title ? [section.title] : []),
+        ...headings(section),
+        ...codeTerms(section),
+      ],
+      description: sectionSummary(section),
+      prose: sectionProse(section),
+      _topic: name,
+      _section: key,
+      _title: `${docTitle} › ${section.title}`,
+      _command: `astryx docs ${name} ${key}`,
+      _parent: `astryx docs ${name} --index`,
+      ...((sectionPackage?.(key) ?? pkg) ? {_package: sectionPackage?.(key) ?? pkg} : {}),
+    });
+  }
+  return out;
 }
 
 /**
@@ -574,6 +1051,13 @@ async function gatherTemplates(cwd) {
     return [];
   }
   return templates.map(t => {
+    // A replacement's target is its canonical unqualified lookup id. Keep the
+    // integration-owned id as a keyword and response label, but score and print
+    // commands against the id that `template()` resolves back to this entry.
+    // This matters for replacement chains: one replacement's own id can be the
+    // target of another, so using that shadowed id as the command would select
+    // the other template.
+    const commandName = t.replaces ?? t.dirName;
     // Blocks ship an authored componentsUsed; page templates don't, so derive
     // them from the source. Category words (e.g. "Dashboard - Analytics") are
     // strong intent signal for pages, which otherwise only index on name +
@@ -583,7 +1067,10 @@ async function gatherTemplates(cwd) {
     // category words are a deliberate statement of what the template is for,
     // while scraped JSX tags only say what it happens to render. See the
     // scoring table at the top of this file for why the derived set is capped.
-    const keywords = Array.isArray(t.componentsUsed) ? [...t.componentsUsed] : [];
+    const keywords = Array.isArray(t.componentsUsed)
+      ? [...t.componentsUsed]
+      : [];
+    keywords.push(...templateLookupIds(t).filter(id => id !== commandName));
     /** @type {string[]} */
     let weakKeywords = [];
     if (t.type === 'page') {
@@ -594,16 +1081,19 @@ async function gatherTemplates(cwd) {
           // Best-effort: skip keyword enrichment if the source can't be read.
         }
       }
-      if (t.category) keywords.push(...t.category.split(/[^A-Za-z0-9]+/).filter(Boolean));
+      if (t.category)
+        keywords.push(...t.category.split(/[^A-Za-z0-9]+/).filter(Boolean));
     }
     return {
       domain: 'template',
-      name: t.dirName,
+      name: commandName,
       keywords,
       weakKeywords,
       description: t.description || '',
       _displayName: t.name,
       _kind: t.type, // 'page' | 'block'
+      _resultName: t.dirName,
+      _commandName: commandName,
     };
   });
 }
@@ -616,44 +1106,58 @@ async function gatherTemplates(cwd) {
  * @param {Candidate} c - candidate
  * @param {number} score
  * @param {string} reason
+ * @param {number} matchedTerms - Query concepts this result answered.
+ * @param {number} queryTerms - Query concepts there were to answer.
  */
-function toResult(c, score, reason) {
+function toResult(c, score, reason, matchedTerms, queryTerms) {
   const base = {
     domain: c.domain,
-    name: c.name,
+    name: c._resultName ?? c.name,
     score,
     reason,
     description: c.description || '',
   };
+  let result;
   switch (c.domain) {
     case 'component':
-      return {
+      result = {
         ...base,
         import: c._import,
         command: `astryx component ${c.name}`,
       };
+      break;
     case 'hook':
-      return {
+      result = {
         ...base,
         import: c._import,
         command: `astryx hook ${c.name}`,
       };
+      break;
     case 'doc':
-      return {
+      // A doc result names its topic or route, plus the section when the
+      // hit is one section; its command reads exactly that part.
+      result = {
         ...base,
+        name: c._topic ?? c.name,
+        ...(c._section ? {section: c._section} : {}),
         title: c._title,
-        command: `astryx docs ${c.name}`,
+        command: c._command ?? `astryx docs ${c.name}`,
+        ...(c._parent ? {parent: c._parent} : {}),
+        ...(c._package ? {package: c._package} : {}),
       };
+      break;
     case 'template':
-      return {
+      result = {
         ...base,
         displayName: c._displayName,
         kind: c._kind,
-        command: `astryx template ${c.name}`,
+        command: `astryx template ${c._commandName ?? c.name} --type ${c._kind}`,
       };
+      break;
     default:
-      return base;
+      result = base;
   }
+  return setResultCoverage(result, matchedTerms, queryTerms);
 }
 
 /**
@@ -664,7 +1168,7 @@ function toResult(c, score, reason) {
  * @param {string} [options.cwd]
  * @param {'component'|'hook'|'doc'|'template'} [options.type] - Restrict to one domain.
  * @param {number} [options.limit] - Max results (default 20).
- * @returns {Promise<{type: 'search', data: {query: string, results: Array<object>}}>}
+ * @returns {Promise<import('./search.type.mjs').SearchResponse>}
  */
 export async function search(query, options = {}) {
   const {cwd = process.cwd(), type, limit = 20} = options;
@@ -688,10 +1192,7 @@ export async function search(query, options = {}) {
   // Validate limit here (not just in the CLI) so direct API callers get the same
   // contract: a non-positive or non-integer limit is an error, never a silent
   // "return everything". (Previously `limit <= 0` fell through to the full set.)
-  if (
-    limit != null &&
-    (!Number.isInteger(limit) || limit <= 0)
-  ) {
+  if (limit != null && (!Number.isInteger(limit) || limit <= 0)) {
     throw new AstryxError(
       `Invalid limit "${limit}". Must be a positive integer.`,
       undefined,
@@ -702,17 +1203,26 @@ export async function search(query, options = {}) {
   const term = String(query).trim().toLowerCase();
   const tokens = tokenizeQuery(term);
 
-  const coreDir = findCoreDir(cwd);
-  if (!coreDir) {
-    throw new AstryxError('Could not find @astryxdesign/core package');
+  // `astryx docs` reads docs without @astryxdesign/core, so a docs-only
+  // search must too. Every other domain reads core.
+  const docsOnly = type === 'doc';
+  const coreDir = docsOnly ? null : findCoreDir(cwd);
+  if (!docsOnly && !coreDir) {
+    throw new AstryxError(
+      'Could not find @astryxdesign/core package',
+      undefined,
+      ERROR_CODES.ERR_CORE_NOT_FOUND,
+    );
   }
 
   // Gather candidates from each requested domain in parallel.
   /** @param {string} d */
   const wants = d => !type || type === d;
   const [components, hooks, docTopics, templates] = await Promise.all([
-    wants('component') ? gatherComponents(coreDir, cwd) : [],
-    wants('hook') ? gatherHooks(coreDir) : [],
+    wants('component')
+      ? gatherComponents(/** @type {string} */ (coreDir), cwd)
+      : [],
+    wants('hook') ? gatherHooks(/** @type {string} */ (coreDir)) : [],
     wants('doc') ? gatherDocs(cwd) : [],
     wants('template') ? gatherTemplates(cwd) : [],
   ]);
@@ -726,7 +1236,10 @@ export async function search(query, options = {}) {
   const scored = [];
   for (const candidate of all) {
     const hit = scoreQuery(term, tokens, candidate);
-    if (hit) scored.push(toResult(candidate, hit.score, hit.reason));
+    if (hit)
+      scored.push(
+        toResult(candidate, hit.score, hit.reason, hit.matched, hit.total),
+      );
   }
 
   // Sort by score desc, then domain (stable order), then name.
@@ -739,7 +1252,22 @@ export async function search(query, options = {}) {
       a.name.localeCompare(b.name),
   );
 
+  // `results` is bounded by `limit` so a caller (and the recorded run that
+  // quotes it) never carries an unbounded payload. `matchCount` is the number
+  // of matches that bound was applied TO — reporting `results.length` there
+  // would report the cap back as if it were the answer, so a query matching
+  // 57 things and one matching exactly 20 would be indistinguishable.
   const limited = scored.slice(0, limit);
 
-  return {type: 'search', data: {query: String(query).trim(), results: limited}};
+  return {
+    type: 'search',
+    data: {
+      query: String(query).trim(),
+      matchCount: scored.length,
+      // toResult gives every domain its command and domain fields.
+      results: /** @type {import('./search.type.mjs').SearchResultEntry[]} */ (
+        limited
+      ),
+    },
+  };
 }

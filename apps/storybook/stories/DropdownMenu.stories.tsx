@@ -152,8 +152,48 @@ const PROJECT_DESTINATIONS = [
   ['Website refresh', 'Brand'],
 ] as const;
 
-// Basic usage
+// Open action sheet used by the stable visual surface.
 export const Default: Story = {
+  parameters: {
+    layout: 'fullscreen',
+    docs: {
+      story: {inline: false, height: '560px'},
+      description: {
+        story:
+          'Shows titled sections in the bottom-sheet presentation. Section headings and spacious action rows share the same inline content edge.',
+      },
+    },
+  },
+  globals: {viewport: {value: 'mobile1', isRotated: false}},
+  render: () => (
+    <div {...stylex.props(readinessStyles.viewportStoryCanvas)}>
+      <DropdownMenu
+        presentation="bottom-sheet"
+        button={{label: 'File actions'}}
+        items={[
+          {
+            type: 'section',
+            title: 'Create',
+            items: [{label: 'New file'}, {label: 'New folder'}],
+          },
+          {
+            type: 'section',
+            title: 'Manage',
+            items: [{label: 'Share file'}, {label: 'Archive file'}],
+          },
+        ]}
+      />
+    </div>
+  ),
+  play: async ({canvasElement}) => {
+    const trigger = canvasElement.querySelector('button');
+    if (trigger instanceof HTMLElement) {
+      trigger.click();
+    }
+  },
+};
+
+export const BasicPopover: Story = {
   render: () => (
     <DropdownMenu
       button={{label: 'Actions'}}
@@ -314,6 +354,32 @@ export const Controlled: Story = {
         />
       </div>
     );
+  },
+};
+
+// Mounted already open: the menu is visible on first render, but focus stays
+// where it was. Only an open the user initiates moves focus into the first
+// item; from the focused trigger, ArrowDown walks into the open menu (#5976).
+export const MountedOpen: Story = {
+  render: function MountedOpenStory() {
+    const [isOpen, setIsOpen] = useState(true);
+    return (
+      <DropdownMenu
+        button={{label: 'Sort'}}
+        isMenuOpen={isOpen}
+        onOpenChange={setIsOpen}>
+        <DropdownMenuItem label="Newest" />
+        <DropdownMenuItem label="Oldest" />
+      </DropdownMenu>
+    );
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'A controlled menu mounted with `isMenuOpen` true renders open without taking focus; `document.activeElement` stays on the page until the user opens the menu themselves. Tab to the trigger, then ArrowDown enters the already-open menu at the first item.',
+      },
+    },
   },
 };
 
