@@ -1,5 +1,64 @@
 # @xds/theme-matcha
 
+# 0.7.4
+
+#### New Features
+
+- Move Matcha's existing color roles onto its reviewed light and dark ramps, including Tea Gold. Warning and Yellow move from `#FFB600` / `#FFC940` to `#F2C000` / `#F6D066`; related syntax colors and warning inset rings follow the same palette. Consumers that need the former appearance can extend `matchaTheme` and override the affected color, syntax, shadow, and component tokens with their previous values. The complete Matcha palette remains private authoring data, and the CLI template ships the same request, receipt, and runtime-sized references. (#7671)
+
+#### Contributors
+
+Thanks to everyone who contributed to this release:
+
+- @rubyycheung
+
+---
+
+# 0.7.3
+
+---
+
+# 0.7.2
+
+---
+
+# 0.7.1
+
+---
+
+# 0.7.0
+
+#### Breaking Changes
+
+- matcha's and y2k's spacing steps are rem (`--spacing-2: 0.75rem`), so their gaps and padding follow the reader's root font size like the core scale. Every step is the same pixel value at the default 16px root; a reader with a larger root font size now sees proportionally larger spacing on these themes. The CLI's copies of both theme templates and the annotated theme template's spacing example change the same way. (#7374)
+  Migration: nothing to change to take the new behaviour. To keep fixed pixel spacing on one of these themes, extend it and override the steps in px, which is honoured as written: `defineTheme({name: 'app', extends: matchaTheme, tokens: {'--spacing-2': '12px'}})`.
+
+#### Contributors
+
+Thanks to everyone who contributed to this release:
+
+- @cixzhang
+
+---
+
+# 0.6.8
+
+---
+
+# 0.6.7
+
+#### New Features
+
+- Each theme package now exports `/fonts.css` beside `/built` and `/theme.css`. Import it when the theme uses non-system fonts.
+
+#### Contributors
+
+Thanks to everyone who contributed to this release:
+
+- @josephfarina
+
+---
+
 # 0.6.6
 
 #### New Features

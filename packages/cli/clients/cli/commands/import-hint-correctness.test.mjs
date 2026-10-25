@@ -21,7 +21,7 @@ import {
   resolveImportPath,
   discoverComponents,
   findComponentSource,
-} from './component/index.mjs';
+} from './component.mjs';
 import {findCoreDir} from '../../../foundation/fs/paths.mjs';
 import {runCli} from '../../../test-utils/run-cli.mjs';
 
@@ -247,5 +247,28 @@ describe('import hint correctness', () => {
         expect(subpath.toLowerCase()).toBe(topDir.toLowerCase());
       });
     }
+  });
+
+  describe('CLI --detail brief text output for a single component', () => {
+    it('brief text output names the component and its package', async () => {
+      const result = await runCli(['component', 'Button', '--detail', 'brief'], REPO_ROOT);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('Button');
+      expect(result.stdout).toContain('@astryxdesign/core');
+    });
+
+    it('brief text is shorter than compact text', async () => {
+      const brief = await runCli(['component', 'Button', '--detail', 'brief'], REPO_ROOT);
+      const compact = await runCli(['component', 'Button', '--detail', 'compact'], REPO_ROOT);
+      expect(brief.code).toBe(0);
+      expect(compact.code).toBe(0);
+      expect(brief.stdout.length).toBeLessThan(compact.stdout.length);
+    });
+
+    it('brief text shows the import path in the signature line', async () => {
+      const result = await runCli(['component', 'Button', '--detail', 'brief'], REPO_ROOT);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('@astryxdesign/core/Button');
+    });
   });
 });

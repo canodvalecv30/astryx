@@ -6,7 +6,7 @@
 
 import {jsonOut} from '../../../foundation/response/json.mjs';
 import {emit, section, text, records, code, record} from '../formatters/index.mjs';
-import {cliError} from '../lib/cli-error.mjs';
+import {cliError, rejectEmptyArgument} from '../lib/cli-error.mjs';
 import {template as templateApi} from '../../../api/template/template.mjs';
 import {Project} from '../../../foundation/config/project.mjs';
 import {warnOnIntegrationIssues} from '../../../foundation/integrations/integration-warnings.mjs';
@@ -31,6 +31,38 @@ export {discoverTemplates, listTemplates} from '../../../api/template/template.m
  *   import('../../../api/template/template.type.mjs').TemplateCdnResponse
  * )} TemplateResponse
  */
+
+/**
+ * The icon report as text lines (AST-084 FR10): one line per mapped or kept
+ * icon, or one line saying why nothing was mapped. Nothing when the project
+ * has no icon set at all (no report: icon sets are experimental).
+ * @param {import('../../../api/template/template.type.mjs').TemplateIconsReport | undefined} icons
+ * @returns {string[]}
+ */
+function iconLines(icons) {
+  if (icons == null) return [];
+  if (icons.status !== 'selected') {
+    return icons.status === 'none'
+      ? []
+      : [`icons: unchanged (${icons.status}): ${icons.reason}`];
+  }
+  return [
+    ...icons.mapped.map(
+      each =>
+        `icons: mapped ${each.source.export} (${each.source.module}) -> ${each.target.export} (${each.target.module}) by ${each.by}` +
+        (each.dropped && each.dropped.length > 0
+          ? `; dropped ${each.dropped.join(', ')} (size comes from CSS)`
+          : ''),
+    ),
+    ...icons.kept.map(
+      each =>
+        `icons: kept ${each.export}${each.module == null ? '' : ` (${each.module})`}: ${each.reason}` +
+        (each.suggestion
+          ? `; likely match: ${each.suggestion.export} (${each.suggestion.module})`
+          : ''),
+    ),
+  ];
+}
 
 /**
  * What the run answered with. Listing and printing a template are lookups;
@@ -66,6 +98,12 @@ export function registerTemplate(program) {
        * @param {{list?: boolean, type?: string, package?: string, skeleton?: boolean, cdn?: boolean | string, overwrite?: boolean}} options
        */
       async (name, targetPath, options) => {
+      const usesName = !options.cdn && !options.list;
+      const usesPath = options.cdn
+        ? typeof options.cdn !== 'string'
+        : !options.list && !options.skeleton;
+      if (usesName) rejectEmptyArgument('name', name, 'astryx template');
+      if (usesPath) rejectEmptyArgument('path', targetPath, 'astryx template');
       const json = program.opts().json || false;
       const run = getCliInvocation();
 
@@ -137,9 +175,9 @@ export function registerTemplate(program) {
               return lines.join('\n');
             };
             emit(
-              section(`Page Templates (${pages.length})`),
+              pages.length > 0 && section(`Page Templates (${pages.length})`),
               pages.length > 0 && text(grouped(pages)),
-              section(`Block Templates (${blocks.length})`),
+              blocks.length > 0 && section(`Block Templates (${blocks.length})`),
               blocks.length > 0 && text(grouped(blocks)),
               section('Usage'),
               text(
@@ -207,7 +245,7 @@ export function registerTemplate(program) {
           // from (cli-surface INV28) and the note about replaced demo media go
           // to stderr, the note in the copy receipt's words. (Text mode only:
           // --json returned above with both in the envelope.)
-          const {source, demoMediaReplaced} = result.data;
+          const {source, demoMediaReplaced, icons} = result.data;
           console.error(`package: ${result.package}`);
           emit(code(source));
           if (demoMediaReplaced > 0) {
@@ -216,12 +254,16 @@ export function registerTemplate(program) {
                 'images now show a neutral placeholder and videos have an empty source. Supply your own media there.',
             );
           }
+          // The icon report goes to stderr too, so stdout stays the source.
+          for (const line of iconLines(icons)) console.error(line);
           break;
         }
 
         case 'template.copy': {
-          const {outputDir, fileName, demoMediaReplaced} = result.data;
+          const {outputDir, fileName, demoMediaReplaced, notes, icons} =
+            result.data;
           const file = `${outputDir}/${fileName}`;
+          const iconText = iconLines(icons);
           emit(
             text(`Copied template to ${file}`),
             record({package: result.package}),
@@ -230,6 +272,8 @@ export function registerTemplate(program) {
                 `Replaced ${demoMediaReplaced} Astryx demo media reference${demoMediaReplaced === 1 ? '' : 's'} in ${file}: ` +
                   'images now show a neutral placeholder and videos have an empty source. Supply your own media there.',
               ),
+            ...notes.map(/** @param {string} note */ note => text(note)),
+            iconText.length > 0 && text(iconText.join('\n')),
           );
           break;
         }

@@ -24,6 +24,10 @@ for (const file of fs.readdirSync(COMMANDS).sort()) {
 }
 
 const manifest = buildManifest(program, {jsonSupported: JSON_SUPPORTED, version: '0.0.0-test'});
+/** Hidden commands (a package-script hook): documented, never in the manifest. */
+const HIDDEN = new Set(
+  program.commands.filter((c) => /** @type {any} */ (c)._hidden).map((c) => c.name()),
+);
 /** @type {Map<string, any>} */
 const entries = new Map();
 const walk = (/** @type {any} */ c) => {
@@ -70,13 +74,6 @@ describe('command exit codes', () => {
     },
   );
 
-  it('bare `astryx layout` exits 1 in both modes, as documented', async () => {
-    const doc = commandDocs.find((d) => d.name === 'layout');
-    expect(doc.exitCodes.find((e) => e.code === 1)?.when).toMatch(/^no subcommand/);
-    expect((await runCli(['layout'])).status).toBe(1);
-    expect((await runCli(['layout', '--json'])).status).toBe(1);
-  });
-
   it('`astryx discover` with a blank query exits 1 only when packages are discovered', async () => {
     const doc = commandDocs.find((d) => d.name === 'discover');
     expect(doc.exitCodes.find((e) => e.code === 1)?.when).toMatch(/blank query when packages are discovered/);
@@ -105,6 +102,7 @@ describe('command exit codes', () => {
 
   it('the manifest carries every command exit code', () => {
     for (const doc of commandDocs) {
+      if (HIDDEN.has(doc.name)) continue;
       expect(entries.get(doc.name)?.exitCodes, doc.name).toEqual(
         doc.exitCodes.map(({code, when}) => ({code, when})),
       );

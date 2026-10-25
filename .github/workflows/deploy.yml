@@ -61,7 +61,9 @@ jobs:
           pnpm vitest run --project ui packages/core/src/Markdown/Markdown.fr23.perf.test.ts --no-file-parallelism
 
   test-node:
-    runs-on: 2-core-ubuntu-arm
+    # Vitest runs one test file per CPU beyond the first, so the 2-core runner
+    # ran this suite one file at a time (~23 min). Four cores give it three.
+    runs-on: 4-core-ubuntu
     permissions:
       contents: read
     steps:
@@ -123,6 +125,20 @@ jobs:
 
       - name: Typecheck core (including tests)
         run: pnpm -F @astryxdesign/core typecheck
+
+      # The other component packages' own sources and tests, like core's: their
+      # typecheck:docs gates above cover only their .doc.mjs files.
+      - name: Typecheck lab (including tests)
+        run: pnpm -F @astryxdesign/lab typecheck
+
+      - name: Typecheck charts (including tests)
+        run: pnpm -F @astryxdesign/charts typecheck
+
+      - name: Typecheck rich text (including tests)
+        run: pnpm -F @astryxdesign/richtext typecheck
+
+      - name: Typecheck Vega (including tests)
+        run: pnpm -F @astryxdesign/vega typecheck
 
       # The accessibility spec-test contracts are consumed as TypeScript source
       # by Vitest and Playwright, and neither runner typechecks. This is the

@@ -47,7 +47,9 @@ function attemptFocus(element: HTMLElement): boolean {
   } catch {
     // Ignore non-focusable elements; the caller will try the next target.
   }
-  return document.activeElement === element;
+  // The element's own document: a popover rendered into a second document
+  // (an iframe, a Picture-in-Picture window) never moves this one's focus.
+  return element.ownerDocument.activeElement === element;
 }
 
 function focusFirstContentControl(container: HTMLElement): boolean {
@@ -258,9 +260,8 @@ export interface UsePopoverOptions {
    * or radius rule paints the wrong box. Name the surface through this option
    * and document the class in the component's `theming.targets`.
    *
-   * The canonical `astryx-popover` target and deprecated
-   * `astryx-popover-surface` compatibility alias are always present alongside
-   * any component-owned refinement target.
+   * The canonical `astryx-popover` target is always present alongside any
+   * component-owned refinement target.
    */
   surfaceTarget?: string;
 }
@@ -444,13 +445,17 @@ function usePopoverImplementation(
 
   // Auto-focus first element when popover opens (unless skipped)
   useEffect(() => {
-    if (layer.isOpen && hasAutoFocus && !skipAutoFocusRef.current) {
-      // Use requestAnimationFrame to ensure DOM is ready
-      requestAnimationFrame(focusInitialTarget);
-    }
     // Reset the per-open focus preference after the popover closes.
     if (!layer.isOpen) {
       skipAutoFocusRef.current = false;
+      return;
+    }
+    if (hasAutoFocus && !skipAutoFocusRef.current) {
+      // Wait a frame so the content is mounted. A popover that closes or
+      // unmounts first cancels it: the frame would otherwise move focus into
+      // content that is no longer shown, after the close had left it alone.
+      const frame = requestAnimationFrame(focusInitialTarget);
+      return () => cancelAnimationFrame(frame);
     }
   }, [layer.isOpen, hasAutoFocus, focusInitialTarget]);
 
@@ -505,9 +510,7 @@ function usePopoverImplementation(
       // `mergeProps` is positional — a third OBJECT argument is read as
       // `style`, not as more props — so the surface's classes are composed
       // into one props object before merging with the StyleX result.
-      const surfaceProps = themeProps('popover', undefined, {
-        legacyNames: ['popover-surface'],
-      });
+      const surfaceProps = themeProps('popover');
       const surfaceClassName =
         surfaceTarget != null && surfaceTarget !== 'popover'
           ? `${surfaceProps.className} ${stableClassName(surfaceTarget)}`

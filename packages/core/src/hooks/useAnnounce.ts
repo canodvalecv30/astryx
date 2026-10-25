@@ -4,7 +4,7 @@
 
 /**
  * @file useAnnounce.ts
- * @input Uses React useCallback; DOM APIs for a singleton live-region pair
+ * @input Uses React useCallback; DOM APIs and one cancellable animation frame per region for a singleton live-region pair
  * @output Exports useAnnounce hook and AnnouncePoliteness type
  * @position Core a11y hook; provides imperative screen-reader announcements
  *   via persistently-mounted polite/assertive live regions; regions are
@@ -72,6 +72,37 @@ function cancelScheduledClear(politeness: AnnouncePoliteness): void {
   }
 }
 
+// Messages announced before the region exposes them (written in the same
+// frame) wait here and are exposed together, in order, so none is dropped;
+// an identical repeat is the same message and is kept once (spec:AST-086
+// FR9). One frame per region writes them.
+const pendingFrames: Record<AnnouncePoliteness, number | null> = {
+  polite: null,
+  assertive: null,
+};
+// Each pending message counts the announcers waiting on it, so one of them
+// withdrawing it (a busy start overtaken by its outcome) leaves it in place
+// for the others.
+interface PendingMessage {
+  text: string;
+  holders: number;
+}
+const pendingMessages: Record<AnnouncePoliteness, PendingMessage[]> = {
+  polite: [],
+  assertive: [],
+};
+// The pending message the latest announce joined, until its announcer takes it.
+let lastJoined: PendingMessage | null = null;
+
+function cancelPendingFrames(politeness: AnnouncePoliteness): void {
+  const frame = pendingFrames[politeness];
+  if (frame != null) {
+    cancelAnimationFrame(frame);
+    pendingFrames[politeness] = null;
+  }
+  pendingMessages[politeness] = [];
+}
+
 function scheduleClear(
   politeness: AnnouncePoliteness,
   target: HTMLElement,
@@ -131,14 +162,31 @@ function announceMessage(
     return;
   }
   const target = politeness === 'assertive' ? r.assertive : r.polite;
-  // Clearing first guarantees the mutation is observed even when the new
-  // message equals the current text — some AT deduplicate identical content.
-  target.textContent = '';
-  // A microtask/rAF-free re-set in the next frame is more reliable across AT
-  // than an immediate re-set, which can be coalesced with the clear.
-  requestAnimationFrame(() => {
-    target.textContent = message;
-  });
+  const repeat = pendingMessages[politeness].find(
+    pending => pending.text === message,
+  );
+  if (repeat != null) {
+    repeat.holders += 1;
+    lastJoined = repeat;
+    return;
+  }
+  const pending = {text: message, holders: 1};
+  pendingMessages[politeness].push(pending);
+  lastJoined = pending;
+  if (pendingFrames[politeness] == null) {
+    // Clearing first guarantees the mutation is observed even when the new
+    // message equals the current text — some AT deduplicate identical content.
+    target.textContent = '';
+    // A re-set in the next frame is more reliable across AT than an immediate
+    // re-set, which can be coalesced with the clear.
+    pendingFrames[politeness] = requestAnimationFrame(() => {
+      pendingFrames[politeness] = null;
+      target.textContent = pendingMessages[politeness]
+        .map(pending => pending.text)
+        .join(' ');
+      pendingMessages[politeness] = [];
+    });
+  }
   // Auto-clear so the last message does not linger in the accessibility tree
   // indefinitely. Scheduled per announce, so a newer announcement always
   // resets the countdown (the delay comfortably outlasts the rAF re-set).
@@ -151,6 +199,7 @@ function announceMessage(
  * so stale status text does not linger in the accessibility tree.
  */
 function clearRegion(politeness: AnnouncePoliteness): void {
+  cancelPendingFrames(politeness);
   cancelScheduledClear(politeness);
   if (!regions) {
     return;
@@ -167,7 +216,8 @@ function clearRegion(politeness: AnnouncePoliteness): void {
  * The polite and assertive regions are created once on first use and kept
  * mounted, so announcements are reliable even for messages that appear
  * immediately (unlike a live region rendered together with its content).
- * Each message is automatically cleared a couple of seconds after being
+ * Messages announced in the same frame are joined, in order, into one
+ * announcement, and an identical repeat is kept once. Each message is automatically cleared a couple of seconds after being
  * announced, so users browsing the DOM later do not encounter stale status
  * text; announcing again before the clear simply resets the countdown.
  *
@@ -186,8 +236,9 @@ export function useAnnounce(): AnnounceFn {
   return useCallback(
     (message: string, politeness: AnnouncePoliteness = 'polite') => {
       if (!message) {
-        // An empty message clears any lingering status from the region rather
-        // than announcing nothing — useful when the triggering context ends.
+        // An empty message clears any lingering status from the region,
+        // including messages joined but not yet exposed — useful when the
+        // triggering context ends.
         clearRegion(politeness);
         return;
       }
@@ -198,14 +249,52 @@ export function useAnnounce(): AnnounceFn {
 }
 
 /**
+ * Takes the pending message the latest announce joined, so that announcer can
+ * withdraw its own share of it later. Shared with useBusyAnnouncement; not
+ * exported from the hooks index.
+ *
+ * @internal
+ */
+export function takeJoinedAnnouncement(): object | null {
+  const joined = lastJoined;
+  lastJoined = null;
+  return joined;
+}
+
+/**
+ * Withdraws one announcer's share of a message still waiting to be exposed, so
+ * a busy start overtaken by its own outcome is never spoken (spec:AST-086 FR8).
+ * The message stays while another announcer still holds it.
+ *
+ * @internal
+ */
+export function withdrawPendingAnnouncement(
+  joined: object,
+  politeness: AnnouncePoliteness,
+): void {
+  const pending = pendingMessages[politeness];
+  const index = pending.indexOf(joined as PendingMessage);
+  if (index < 0) {
+    return;
+  }
+  pending[index].holders -= 1;
+  if (pending[index].holders <= 0) {
+    pending.splice(index, 1);
+  }
+}
+
+/**
  * Test-only helper: removes the singleton live regions and resets state so
  * each test starts clean. Not part of the public runtime API.
  *
  * @internal
  */
 export function __resetLiveRegionsForTest(): void {
+  cancelPendingFrames('polite');
+  cancelPendingFrames('assertive');
   cancelScheduledClear('polite');
   cancelScheduledClear('assertive');
+  lastJoined = null;
   if (regions) {
     regions.polite.remove();
     regions.assertive.remove();

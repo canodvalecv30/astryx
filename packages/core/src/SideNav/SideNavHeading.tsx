@@ -4,7 +4,8 @@
 
 /**
  * @file SideNavHeading.tsx
- * @input Uses React, useRef, useCallback, ReactNode, StyleX, usePopover
+ * @input Uses React, useRef, useCallback, ReactNode, StyleX, usePopover,
+ *        useMenuHover
  * @output Exports SideNavHeading component and SideNavHeadingProps
  * @position Core implementation; used inside SideNav header slot
  *
@@ -187,6 +188,17 @@ const styles = stylex.create({
     // font-size back to inherit to keep the glyph at the 14px it renders at
     // today. The 28px min box still wins over Icon's width/height.
     fontSize: 'inherit',
+  },
+  // The link part of a whole-heading link row that also has end content.
+  linkBesideEndContent: {
+    display: 'flex',
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    gap: spacingVars['--spacing-2'],
+    flexGrow: 1,
+    minWidth: 0,
+    textDecoration: 'none',
+    color: 'inherit',
   },
   headerEndContent: {
     flexShrink: 0,
@@ -397,6 +409,12 @@ export function SideNavHeading({
     isOpen: popover.isOpen,
     isEnabled: !!menu,
     showDelay: 0,
+    // Collapsed, the flyout opens beside the icon button, so a press on the
+    // button lands outside the auto popover and the browser would light-dismiss
+    // a hover-open before the click guard can confirm it. Expanded, the panel
+    // overlaps the heading, and the trigger is a <div> whose click must not be
+    // default-prevented: it holds the heading's own links.
+    popoverId: isCollapsed ? popover.id : undefined,
   });
 
   const closeMenuCtx = useMemo(() => ({closeMenu}), [closeMenu]);
@@ -632,6 +650,36 @@ export function SideNavHeading({
       )}
     </button>
   );
+
+  // Whole heading is a link (no menu, single headingHref). End content may
+  // be a control, which must not sit inside the link (no interactive content
+  // in an <a>), so with end content the row is a div holding the link and the
+  // end content side by side, as the mixed mode does.
+  if (isWholeHeadingLink && headingHref && headerEndContentElement) {
+    return (
+      <div
+        ref={ref}
+        data-testid={testId}
+        {...mergeProps(
+          themeProps('side-nav-heading'),
+          stylex.props(styles.root, xstyle),
+          className,
+          style,
+        )}>
+        <LinkComponent
+          href={headingHref}
+          {...focusOutlineProps.focusVisible(
+            styles.linkBesideEndContent,
+            styles.menuTrigger,
+          )}
+          {...(props as React.AnchorHTMLAttributes<HTMLAnchorElement>)}>
+          {icon && <span {...stylex.props(styles.icon)}>{icon}</span>}
+          {renderTextContent()}
+        </LinkComponent>
+        {headerEndContentElement}
+      </div>
+    );
+  }
 
   // Whole heading is a link (no menu, single headingHref)
   if (isWholeHeadingLink && headingHref) {

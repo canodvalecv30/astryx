@@ -4,7 +4,8 @@
 
 /**
  * @file Lightbox.tsx
- * @input Uses React, native dialog, StyleX, IconButton, theme tokens, layerTextReset
+ * @input Uses React, native dialog, StyleX, IconButton, theme tokens, layerTextReset, layerStructureReset,
+ *   isRtlElement (gallery arrow keys follow the rendered direction)
  * @output Exports Lightbox component, LightboxProps, LightboxMedia
  * @position Core implementation; consumed by index.ts
  *
@@ -38,6 +39,7 @@ import type {BaseProps} from '../BaseProps';
 import {themeProps} from '../utils/themeProps';
 import {focusOutlineStyles} from '../utils/focusOutline.stylex';
 import {layerTextReset} from '../Layer/layerTextReset.stylex';
+import {layerStructureReset} from '../Layer/layerStructureReset.stylex';
 import {LayerContentBoundary} from '../Layer/layerScopedContext';
 import {overlayPaddingReset} from '../Layout/padding.stylex';
 import {LayerDepthProvider} from '../Layer/LayerDepthContext';
@@ -45,6 +47,7 @@ import {useLayerDismissal} from '../Layer/useLayerDismissal';
 import {useTranslator} from '../i18n';
 
 import {useMergedRefs} from '../hooks/useMergedRefs';
+import {isRtlElement} from '../hooks/isRtlElement';
 /**
  * Media type for lightbox items.
  */
@@ -273,7 +276,9 @@ const KEYBOARD_PAN_OFFSETS: Record<string, [number, number]> = {
  * A fullscreen overlay for viewing images at full resolution.
  *
  * Supports single image and gallery modes. In gallery mode, provides
- * prev/next navigation via buttons and arrow keys. Optionally supports
+ * prev/next navigation via buttons and arrow keys; the arrow keys follow
+ * the writing direction (in RTL, ArrowLeft goes to the next item, like the
+ * Next button on the left). Optionally supports
  * zoom (double-click, Enter/Space on the image, or `+`/`-` to toggle 2x)
  * and pan (drag or arrow keys when zoomed; arrows navigate the gallery
  * when not zoomed).
@@ -366,14 +371,20 @@ export function Lightbox({
   // Scroll lock
   useScrollLock(isOpen);
 
-  // Reset zoom on image change
-  useEffect(() => {
-    // Reset image view state when the active media item changes.
-    // eslint-disable-next-line @eslint-react/set-state-in-effect
+  // A new media item starts unzoomed. Adjusted during render, so the new item
+  // never paints at the previous item's zoom and pan.
+  const currentSrc = currentItem?.src;
+  const [viewedItem, setViewedItem] = useState({index, src: currentSrc});
+  // Object.is, matching the dependency comparison of the effect this replaces:
+  // a controlled index of NaN must not re-render forever.
+  if (
+    !Object.is(viewedItem.index, index) ||
+    !Object.is(viewedItem.src, currentSrc)
+  ) {
+    setViewedItem({index, src: currentSrc});
     setZoom(1);
-    // eslint-disable-next-line @eslint-react/set-state-in-effect
     setPan({x: 0, y: 0});
-  }, [index, currentItem?.src]);
+  }
 
   // Announce gallery navigation to screen readers. Moving between images only
   // updates the visual counter, which is silent to assistive tech, so mirror
@@ -427,6 +438,9 @@ export function Lightbox({
   const {shouldDismissOnCloseRequest} = useLayerDismissal({
     isActive: isOpen,
     onDismiss: handleClose,
+    // The dialog's document is this layer's: rendered into an iframe or a
+    // Picture-in-Picture window, it ranks with the layers opened inside it.
+    getContainer: () => dialogRef.current,
   });
 
   // The native `cancel` event is the browser's own close-watcher firing: an
@@ -506,6 +520,12 @@ export function Lightbox({
 
   // Keyboard navigation. While zoomed, arrows pan the image (matching common
   // lightbox conventions); when not zoomed they navigate the gallery.
+  //
+  // Gallery arrows follow the rendered direction, resolved at keydown: in RTL
+  // the Next button sits on the left, so ArrowLeft goes to the next item and
+  // ArrowRight to the previous one. Panning stays physical in both directions:
+  // the image itself is not mirrored, so ArrowRight still reveals what is to
+  // its right.
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (hasZoom && !isVideo) {
@@ -526,12 +546,15 @@ export function Lightbox({
           return;
         }
       }
-      if (e.key === 'ArrowLeft') {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
-        goToPrev();
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        goToNext();
+        const towardEnd =
+          (e.key === 'ArrowRight') !== isRtlElement(dialogRef.current);
+        if (towardEnd) {
+          goToNext();
+        } else {
+          goToPrev();
+        }
       }
     },
     [hasZoom, isVideo, zoom, applyZoom, goToPrev, goToNext],
@@ -621,6 +644,7 @@ export function Lightbox({
         themeProps('lightbox'),
         stylex.props(
           layerTextReset.reset,
+          layerStructureReset.reset,
           styles.dialog,
           overlayPaddingReset.reset,
           xstyle,

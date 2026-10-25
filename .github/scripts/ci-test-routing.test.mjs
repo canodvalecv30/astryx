@@ -60,14 +60,19 @@ const WORKFLOWS = {
     lanes: ['test-ui', 'test-node'],
     // A PR that only touches docs skips the suite but must still report.
     scopeConditional: true,
+    // Each Vitest lane splits its project across matrix legs.
+    sharded: true,
   },
   'deploy.yml': {
     // The push gate also owns the build + typecheck gates, which need each
     // other and so ride one lane of their own.
     lanes: ['test-ui', 'test-node', 'typecheck'],
     scopeConditional: false,
+    sharded: false,
   },
 };
+
+const SHARD_ARG = '--shard=${{ matrix.shard }}/${{ strategy.job-total }}';
 
 function load(file) {
   return yaml.parse(read(`.github/workflows/${file}`));
@@ -82,8 +87,14 @@ function runLines(job) {
 
 describe.each(Object.entries(WORKFLOWS))(
   '%s test routing',
-  (file, {lanes, scopeConditional}) => {
+  (file, {lanes, scopeConditional, sharded}) => {
     const workflow = load(file);
+
+    it('gives the Node suite more than one Vitest worker', () => {
+      // Vitest uses one worker per CPU beyond the first: on two cores the
+      // suite would run one file at a time.
+      expect(workflow.jobs['test-node']['runs-on']).toBe('4-core-ubuntu');
+    });
 
     it('runs every declared Vitest project in some lane', () => {
       const projects = declaredProjects();
@@ -117,17 +128,65 @@ describe.each(Object.entries(WORKFLOWS))(
       const suites = job.steps.filter(step =>
         step.run?.includes('--project ui'),
       );
-
-      // One conditional step preserves the existing scope gate for both runs.
-      // Exact foreground commands also reject backgrounding or ignored exits.
-      expect(suites).toHaveLength(1);
-      expect(suites[0].run.trim().split('\n')).toEqual([
-        `pnpm vitest run --project ui --exclude ${benchmark}`,
-        `pnpm vitest run --project ui ${benchmark} --no-file-parallelism`,
-      ]);
       expect(job['continue-on-error']).not.toBe(true);
-      expect(suites[0]['continue-on-error']).not.toBe(true);
+      for (const suite of suites) {
+        expect(suite['continue-on-error']).not.toBe(true);
+      }
+
+      if (!sharded) {
+        // One conditional step preserves the existing scope gate for both
+        // runs. Exact foreground commands also reject backgrounding or
+        // ignored exits.
+        expect(suites).toHaveLength(1);
+        expect(suites[0].run.trim().split('\n')).toEqual([
+          `pnpm vitest run --project ui --exclude ${benchmark}`,
+          `pnpm vitest run --project ui ${benchmark} --no-file-parallelism`,
+        ]);
+        return;
+      }
+
+      // Sharded: every leg runs its share without FR23, and exactly one leg
+      // runs FR23 in a later step on the same runner, after its share exited.
+      expect(suites).toHaveLength(2);
+      const [share, isolated] = suites;
+      expect(share.run.trim()).toBe(
+        `pnpm vitest run --project ui --exclude ${benchmark} ${SHARD_ARG}`,
+      );
+      expect(isolated.run.trim()).toBe(
+        `pnpm vitest run --project ui ${benchmark} --no-file-parallelism`,
+      );
+      expect(job.steps.indexOf(isolated)).toBeGreaterThan(
+        job.steps.indexOf(share),
+      );
+      expect(isolated.if).toBe(`matrix.shard == 1 && ${share.if}`);
     });
+
+    if (sharded) {
+      it('splits each Vitest lane across legs that together run every file', () => {
+        for (const lane of lanes) {
+          const job = workflow.jobs[lane];
+          const legs = job.strategy?.matrix?.shard;
+          expect(Array.isArray(legs), `${lane} has no shard matrix`).toBe(true);
+          // Legs are numbered 1..n exactly once, so --shard i/n covers all n.
+          expect(legs).toEqual(
+            Array.from({length: legs.length}, (_, index) => index + 1),
+          );
+          expect(Object.keys(job.strategy.matrix)).toEqual(['shard']);
+          expect(job.strategy['fail-fast']).toBe(false);
+          const suites = job.steps.filter(step =>
+            /--project \w+/.test(step.run ?? ''),
+          );
+          // The one step that is not sharded is the isolated FR23 benchmark.
+          const unsharded = suites.filter(
+            step => !step.run.includes(SHARD_ARG),
+          );
+          for (const step of unsharded) {
+            expect(step.run).toContain('Markdown.fr23.perf.test.ts');
+          }
+          expect(suites.length - unsharded.length).toBe(1);
+        }
+      });
+    }
 
     it('gives no lane the whole suite', () => {
       // A bare `pnpm test` runs every project in one job — the shape that hit
@@ -207,6 +266,77 @@ describe.each(Object.entries(WORKFLOWS))(
   },
 );
 
+describe('ci.yml pr-a11y steps against an older PR head', () => {
+  const steps = load('ci.yml').jobs['pr-a11y'].steps;
+  /** The spec files each `pnpm exec playwright test` in a step names. */
+  const specsOf = step =>
+    (step.run ?? '')
+      .replace(/\\\n/g, ' ')
+      .split('\n')
+      .filter(line => /pnpm exec playwright test\b/.test(line))
+      .flatMap(line =>
+        line
+          .trim()
+          .split(/\s+/)
+          .filter(token => /\.spec\.(ts|tsx|js|mjs)$/.test(token)),
+      );
+  const playwright = steps.filter(step => specsOf(step).length > 0);
+
+  // The wrapper skips spec files a PR head lacks, so a step that named a file
+  // missing on main would pass silently everywhere. Main's steps must name
+  // files that exist; only an older head skips anything.
+  it('names only spec files that exist', () => {
+    expect(playwright.length).toBeGreaterThan(0);
+    for (const step of playwright) {
+      for (const spec of specsOf(step)) {
+        expect(
+          fs.existsSync(path.join(root, spec)),
+          `${step.name}: ${spec}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  // A step that uploads its evidence with `if-no-files-found: error` must not
+  // promise a run the wrapper then skips on an older head.
+  it('promises heading-links evidence only when its spec is in the head', () => {
+    const run = steps.find(
+      step => step.name === 'Run heading-links module browser evidence',
+    ).run;
+    const spec =
+      'packages/core/src/Markdown/plugins/headingLinks.a11y.chromium.spec.ts';
+    const promise = run.indexOf("echo 'should_run=true'");
+    expect(promise).toBeGreaterThan(-1);
+    expect(run.slice(0, promise)).toContain(`if [ -e ${spec} ]; then`);
+  });
+
+  it("sources the merge commit's absent-spec wrapper before every Playwright step", () => {
+    const index = steps.findIndex(
+      step => step.name === 'Skip contract specs the PR head predates',
+    );
+    expect(index).toBeGreaterThan(-1);
+    const wrapper = steps[index];
+    expect(wrapper.if).toBe("github.event_name == 'pull_request'");
+    // The merge commit the steps come from, not the PR's recorded base, which
+    // can lag main and predate the wrapper.
+    expect(wrapper.env.WORKFLOW_SHA).toBe('${{ github.sha }}');
+    expect(wrapper.env.BASE_SHA).toBeUndefined();
+    expect(wrapper.run).toContain(
+      'git show "$WORKFLOW_SHA:.github/scripts/skip-absent-specs.sh" > "$wrapper"',
+    );
+    expect(wrapper.run).toContain('echo "BASH_ENV=$wrapper" >> "$GITHUB_ENV"');
+    expect(
+      fs.existsSync(path.join(root, '.github/scripts/skip-absent-specs.sh')),
+    ).toBe(true);
+    for (const step of playwright) {
+      expect(steps.indexOf(step), step.name).toBeGreaterThan(index);
+      // BASH_ENV reaches bash steps only, and only calls through the function.
+      expect(step.shell ?? 'bash', step.name).toMatch(/^bash/);
+      expect(step.run, step.name).not.toMatch(/\b(exec|command) pnpm\b/);
+    }
+  });
+});
+
 describe('ci.yml RTL package sharding', () => {
   const workflow = load('ci.yml');
   const shard = workflow.jobs['pr-rtl-shard'];
@@ -231,7 +361,13 @@ describe('ci.yml RTL package sharding', () => {
 
   it('binds component evidence source, Storybook bytes, and RTL code to the PR head', () => {
     const exactRef = '${{ github.event.pull_request.head.sha || github.sha }}';
-    for (const name of ['build-storybook', 'pr-a11y', 'pr-rtl-shard']) {
+    for (const name of [
+      'build-storybook',
+      'pr-a11y-shard',
+      'pr-a11y',
+      'a11y-contracts-shard',
+      'pr-rtl-shard',
+    ]) {
       const checkout = workflow.jobs[name].steps.find(candidate =>
         candidate.uses?.startsWith('actions/checkout@'),
       );
@@ -275,7 +411,18 @@ describe('ci.yml RTL package sharding', () => {
   });
 
   it('runs one bounded shard for every canonical component package', () => {
-    expect(shard.strategy.matrix.package).toEqual([...COMPONENT_PACKAGE_NAMES]);
+    const legs = shard.strategy.matrix.include;
+    expect([...new Set(legs.map(leg => leg.package))]).toEqual([
+      ...COMPONENT_PACKAGE_NAMES,
+    ]);
+    // Each package's parts are numbered 1..parts exactly once.
+    for (const name of COMPONENT_PACKAGE_NAMES) {
+      const parts = legs.filter(leg => leg.package === name);
+      expect(parts.map(leg => leg.part)).toEqual(
+        Array.from({length: parts[0].parts}, (_, index) => index + 1),
+      );
+      expect(new Set(parts.map(leg => leg.parts)).size).toBe(1);
+    }
     expect(shard['runs-on']).toBe('4-core-ubuntu');
     expect(shard['timeout-minutes']).toBeLessThanOrEqual(30);
     expect(shard['continue-on-error']).not.toBe(true);
@@ -297,7 +444,7 @@ describe('ci.yml RTL package sharding', () => {
       'produced no explicit should_run decision',
     );
     expect(runLines(shard)).toContain('--packages "$PACKAGE"');
-    expect(runLines(shard)).toContain('--concurrency 4');
+    expect(runLines(shard)).toContain('--concurrency 8');
     expect(runLines(shard)).toContain(
       '.github/scripts/rtl-report-completion.mjs',
     );
@@ -330,15 +477,82 @@ describe('ci.yml RTL package sharding', () => {
   });
 
   it('publishes a distinct scope manifest and optional report for each shard', () => {
-    const upload = shard.steps.find(step =>
-      step.uses?.startsWith('actions/upload-artifact@'),
+    const upload = shard.steps.find(
+      step => step.name === 'Upload RTL shard evidence',
     );
-    expect(upload.if).toBe('always()');
+    expect(upload.if).toBe('always() && matrix.parts == 1');
     expect(upload.with.name).toBe('rtl-audit-report-${{ matrix.package }}');
     expect(upload.with.path).toContain('rtl-shard-scope.json');
     expect(upload.with.path).toContain('rtl-audit-report.json');
     expect(upload.with['if-no-files-found']).toBe('error');
+    const part = shard.steps.find(step => step.name === 'Upload RTL part');
+    expect(part.if).toBe('always() && matrix.parts > 1');
+    expect(part.with.name).toBe(
+      'rtl-audit-part-${{ matrix.package }}-${{ matrix.part }}',
+    );
+    expect(part.with['if-no-files-found']).toBe('error');
   });
+
+  it('joins split packages into the report a whole leg would upload', () => {
+    const merge = workflow.jobs['pr-rtl-merge'];
+    expect(merge.needs).toContain('pr-rtl-shard');
+    expect(merge.if).toContain('always()');
+    const commands = runLines(merge);
+    expect(commands).toContain('--merge-shards rtl-parts');
+    expect(commands).toContain('.github/scripts/rtl-report-completion.mjs');
+    expect(commands).toContain(
+      'case "$code" in 0|1) ;; *) exit "$code" ;; esac',
+    );
+    const upload = merge.steps.find(
+      step => step.name === 'Upload RTL shard evidence',
+    );
+    expect(upload.with.name).toBe('rtl-audit-report-core');
+    expect(upload.with['if-no-files-found']).toBe('error');
+    expect(join.needs).toContain('pr-rtl-merge');
+    // The join's --shards value: the shared result when the parts and the
+    // merge agree (success, or both skipped on an out-of-scope PR), and both
+    // results otherwise, which rtl-join.mjs rejects.
+    const expression = /--shards "\$\{\{(.*?)\}\}"/.exec(runLines(join))[1];
+    const render = (shards, merge) =>
+      new Function(
+        'S',
+        'M',
+        `return ${expression
+          .replaceAll('needs.pr-rtl-shard.result', 'S')
+          .replaceAll('needs.pr-rtl-merge.result', 'M')
+          .replaceAll('==', '===')
+          .replace("format('{0}/{1}', S, M)", '`${S}/${M}`')};`,
+      )(shards, merge);
+    expect(render('success', 'success')).toBe('success');
+    expect(render('skipped', 'skipped')).toBe('skipped');
+    expect(render('success', 'failure')).toBe('success/failure');
+    expect(render('failure', 'skipped')).toBe('failure/skipped');
+    expect(render('failure', 'failure')).toBe('failure');
+  });
+});
+
+describe('full component typechecks', () => {
+  // Each component package's own sources and tests, in both typecheck lanes:
+  // typecheck:docs covers only its .doc.mjs files, so a type error in a test
+  // otherwise lands on main unseen (lab's MobileTokenizer.test.tsx did).
+  const packages = ['core', 'lab', 'charts', 'richtext', 'vega'];
+
+  it.each(['ci.yml', 'deploy.yml'])(
+    '%s typechecks every component package, tests included',
+    file => {
+      const steps = load(file).jobs.typecheck.steps;
+      const command = name => `pnpm -F @astryxdesign/${name} typecheck`;
+      const core = steps.find(step => step.run === command('core'));
+      for (const name of packages) {
+        const step = steps.find(candidate => candidate.run === command(name));
+        expect(step, `${file} does not typecheck ${name}`).toBeDefined();
+        // The same specialized-lane guard as core's (none in deploy.yml).
+        expect(step.if, `${file}: ${name} is not guarded like core`).toBe(
+          core.if,
+        );
+      }
+    },
+  );
 });
 
 describe('deploy.yml push gating', () => {
